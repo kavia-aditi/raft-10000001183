@@ -1,0 +1,212 @@
+---
+title: "Raft safety and operational internals"
+sidebarTitle: "Engineering guide"
+description: "Source-grounded guide to Raft commitment, membership, configuration, follower replication, snapshots, compaction, and log cache safety boundaries."
+keywords:
+  - "raft"
+  - "commitment"
+  - "replication"
+  - "membership"
+  - "snapshots"
+  - "configuration"
+  - "log cache"
+---
+
+HashiCorp Raft manages a replicated log and delegates application state to your FSM. This guide explains the safety-sensitive paths you must understand before operating or changing the library, including where acknowledgment, commitment, application, and persistence are different events.
+
+## Source scope and evidence
+
+**Verified scope:** the accessible source is `kavia-aditi/raft-10000001183`, branch `main`, whose `go.mod` declares module `github.com/hashicorp/raft`. This is the source you approved, not a separately inspected upstream checkout. The exact upstream release and immutable commit identity are **Unknown** here. Citations identify supplied files and symbols; links target the approved repository's mutable `main` branch.
+
+Unless marked otherwise, implementation statements below are **Verified** against the cited code. Examples illustrate those rules, not executed tests. External backend crash guarantees, dependency internals, production performance, and application-specific snapshot formats are **Unknown** unless established by your implementations. No tests were executed for this guide.
+
+## Architecture and integration contracts
+
+`NewRaft(conf, fsm, logs, stable, snaps, trans)` joins six responsibilities: runtime policy, application state, replicated log storage, stable metadata, snapshot storage, and RPC transport. It validates configuration, loads term/log state, restores snapshot state, attempts optional committed-log recovery, scans remaining configuration entries, installs a heartbeat handler, and starts the main, FSM, and snapshot loops. Initial state is `Follower`. A transport lacking `WithPreVote` disables pre-vote even when `PreVoteDisabled` is false. [Source: api.go, NewRaft](https://github.com/kavia-aditi/raft-10000001183/blob/main/api.go)
+
+| Interface | Your obligation and boundary |
+| --- | --- |
+| `FSM` | Deterministic `Apply`, quick state capture in `Snapshot`, and replacement of all prior state in `Restore`. Raft does not interpret application commands. |
+| `LogStore` | Read/write indexed logs; `FirstIndex`/`LastIndex` return zero when empty; `DeleteRange` includes both endpoints. Default contract permits index gaps. |
+| `StableStore` | Store byte and uint64 metadata. This is separate from the replicated log and FSM. |
+| `SnapshotStore` | `Create` a sink, `List` newest/highest-index snapshots first, and `Open` a snapshot by opaque ID. |
+| `Transport` | Supply RPC delivery, peer address encoding, and optional pipelining. Replication policy does not establish a custom transport's timeout or security guarantees. |
+
+Sources: [fsm.go, FSM/FSMSnapshot](https://github.com/kavia-aditi/raft-10000001183/blob/main/fsm.go), [log.go, LogStore](https://github.com/kavia-aditi/raft-10000001183/blob/main/log.go), [stable.go, StableStore](https://github.com/kavia-aditi/raft-10000001183/blob/main/stable.go), [snapshot.go, SnapshotStore/SnapshotSink](https://github.com/kavia-aditi/raft-10000001183/blob/main/snapshot.go), [transport.go](https://github.com/kavia-aditi/raft-10000001183/blob/main/transport.go).
+
+The normal write path is:
+
+```text
+Apply/ApplyLog -> applyCh -> leader dispatchLogs -> local StoreLogs
+  -> replication goroutines -> follower AppendEntries -> follower StoreLogs
+  -> voter match indexes -> leader commitment -> processLogs
+  -> FSM queue -> FSM Apply/ApplyBatch -> application response
+```
+
+`ApplyLog` uses only submitted `Data` and `Extensions`; it creates a `LogCommand`, assigning index, term, and append time later. Its timeout bounds enqueueing, not commitment or FSM execution. With `BatchApplyCh`, enqueueing can finish into a buffer before the leader processes the request, weakening even the apparent processing-time guarantee. Leadership loss returns `ErrLeadershipLost` for outstanding leader operations; it is not proof that a command cannot subsequently commit. Build application-level retry/deduplication policy accordingly. Sources: [api.go, Apply/ApplyLog](https://github.com/kavia-aditi/raft-10000001183/blob/main/api.go), [raft.go, runLeader/dispatchLogs](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go), [config.go, BatchApplyCh](https://github.com/kavia-aditi/raft-10000001183/blob/main/config.go).
+
+## How the leader decides commitment
+
+### Voter match indexes and the current-term boundary
+
+Each leadership term creates a fresh `commitment` with one match index, initially zero, per `Voter`. Nonvoters and staging servers do not contribute. `startIndex` is the leader's previous last index plus one, the first index it may create in this term. The leader appends a no-op to establish the current-term commitment boundary. [Sources: commitment.go, newCommitment/recalculate](https://github.com/kavia-aditi/raft-10000001183/blob/main/commitment.go), [raft.go, setupLeaderState/runLeader](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go).
+
+`match(server, index)` accepts only known voters and only increasing indexes. `recalculate` sorts ascending and selects element `(n-1)/2`, the highest prefix stored by a strict majority. It advances `commitIndex` only when this candidate exceeds both the old commit index and, inclusively, `startIndex`. With no voters it does nothing. It does not inspect log terms, read storage, perform RPCs, or apply entries; the caller supplies the current-term boundary and trustworthy acknowledgments.
+
+For three voters with sorted matches `[7, 10, 12]`, the quorum candidate is 10. If `startIndex=11`, nothing advances yet. Matches `[7, 11, 12]` allow commitment through 11, including older entries in that prefix. For four voters, `[4, 8, 9, 10]` selects 8, requiring three copies, not two. [Source: commitment.go, match/recalculate](https://github.com/kavia-aditi/raft-10000001183/blob/main/commitment.go).
+
+`setConfiguration` immediately replaces the voter map, retaining surviving voter matches and initializing newly introduced voters to zero. It recalculates but never lowers an already reached commit index. This is a single active voter set, not a joint-consensus calculation over old and new majorities. Sources: [commitment.go, setConfiguration](https://github.com/kavia-aditi/raft-10000001183/blob/main/commitment.go), [raft.go, appendConfigurationEntry](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go).
+
+### Persistence, acknowledgment, and application
+
+`dispatchLogs` assigns sequential indexes/current term, records futures as inflight, optionally stages the existing commit index, and writes locally with `StoreLogs`. Only successful storage reports the leader's own match and triggers replicators. Failure responds with the storage error and changes state to `Follower`; the log store's partial-write/crash semantics are not established by this method.
+
+Successful follower append responses report the last entry actually sent to `commitment.match`; empty append responses do not advance that match. Successful snapshot installation reports the snapshot index instead. The leader consumes a coalescible commit notification, reads the latest calculated index, updates committed membership if crossed, and hands committed entries to `processLogs`. Sources: [raft.go, dispatchLogs/leaderLoop](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go), [replication.go, updateLastAppended/sendLatestSnapshot](https://github.com/kavia-aditi/raft-10000001183/blob/main/replication.go).
+
+`processLogs` walks the committed prefix, skips already processed indexes, and queues FSM work in batches bounded by `MaxAppendEntries`. A missing committed log panics. No-op and legacy membership entries do not call application `Apply`; modern configuration entries reach the FSM path only with protocol greater than 2. `AppliedIndex` tracks dispatch toward the FSM, not guaranteed completion of your application code. Use `Barrier` when you need all preceding operations applied; it does not itself implement a general read-consistency protocol. Sources: [raft.go, processLogs/prepareLog](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go), [api.go, Barrier/AppliedIndex](https://github.com/kavia-aditi/raft-10000001183/blob/main/api.go).
+
+The nonbatch FSM path calls `ConfigurationStore.StoreConfiguration` only when that optional interface exists; otherwise configuration entries do not update its internal snapshot index. The batch path sends command/configuration entries to `ApplyBatch`, filters barriers, and panics if response count differs from submitted count. Do not assume every Raft log index is an application command. [Sources: fsm.go, runFSM](https://github.com/kavia-aditi/raft-10000001183/blob/main/fsm.go), [configuration.go, ConfigurationStore](https://github.com/kavia-aditi/raft-10000001183/blob/main/configuration.go).
+
+## Cluster membership changes
+
+### Identities, validation, and transformations
+
+A `Server` has stable `ID`, transport `Address`, and `Suffrage`. Numeric suffrage values are persisted: `Voter=0`, `Nonvoter=1`, `Staging=2`; do not renumber them. Staging is deprecated and behaves as nonvoting. `checkConfiguration` rejects empty/duplicate IDs, empty/duplicate addresses, and zero voters. It does not verify reachability, address syntax, capacity, or catch-up, and does not explicitly reject unknown suffrage values. [Source: configuration.go, Server/checkConfiguration](https://github.com/kavia-aditi/raft-10000001183/blob/main/configuration.go).
+
+`nextConfiguration` clones the server slice, rejects a nonzero `prevIndex` unequal to the latest configuration index, applies one operation, and validates the result:
+
+| Operation | Exact transformation |
+| --- | --- |
+| `AddVoter` | Insert a voter, promote an existing nonvoter/staging member directly to voter, or update an existing voter's address. |
+| `AddNonvoter` | Insert nonvoter; update an existing member's address without demoting a voter or staging member. |
+| `DemoteVoter` | Set a present member's suffrage to nonvoter; absent ID leaves configuration unchanged. |
+| `RemoveServer` | Remove matching ID; absent ID leaves configuration unchanged. |
+| `Promote` | Change staging to voter only; other cases unchanged. Deprecated. |
+
+**Important discrepancy:** `AddVoter` API commentary describes staging and promotion after readiness, but this source's `nextConfiguration(AddVoter)` installs `Voter` immediately. Do not rely on automatic catch-up gating. A safer proposed operational sequence is to add a nonvoter, establish readiness using your own policy, then call `AddVoter`; no readiness threshold is provided by this transformation. `AddStaging` is a deprecated alias for numeric command zero, actually `AddVoter`. [Sources: configuration.go, nextConfiguration](https://github.com/kavia-aditi/raft-10000001183/blob/main/configuration.go), [api.go, AddVoter](https://github.com/kavia-aditi/raft-10000001183/blob/main/api.go).
+
+### Serialization and state transitions
+
+Changes must be submitted to the leader. Followers/candidates reject with `ErrNotLeader`. The leader enables the membership-request channel only after its latest configuration is committed and it has committed an entry at or beyond this term's `startIndex`. Thus at most one configuration change is outstanding. A queued request may time out while this gate is closed; its timeout is not an end-to-end replication deadline. `prevIndex=0` disables the optimistic concurrency check. [Source: raft.go, requestConfigChange/configurationChangeChIfStable/runFollower/runCandidate](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go).
+
+`appendConfigurationEntry` computes and dispatches the full replacement configuration, makes it `latest`, changes the commitment voter set immediately, then starts/stops replication using that latest set. It does not wait for commitment before changing the active quorum calculation. The leader later marks it `committed` when commit index crosses the configuration index. If that committed configuration leaves the leader without a vote, it shuts down by default or transitions to follower when `ShutdownOnRemove=false`; this also covers demotion, not only complete removal. Removed replication workers attempt best-effort delivery through the current last index and stop, without guaranteed final delivery. [Source: raft.go, appendConfigurationEntry/startStopReplication/leaderLoop](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go).
+
+Followers maintain `latest` and `committed` configurations. Receiving a subsequent configuration entry treats the prior latest configuration as committed. A conflicting suffix that includes the latest configuration resets latest to committed before replacement entries are processed. `GetConfiguration` reports the latest configuration, which may be uncommitted; do not treat retrieval as a commit barrier. [Sources: raft.go, processConfigurationLogEntry/appendEntries](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go), [api.go, GetConfiguration](https://github.com/kavia-aditi/raft-10000001183/blob/main/api.go).
+
+Protocol gates are explicit: `AddVoter`/`RemoveServer` require version at least 2; `AddNonvoter`/`DemoteVoter` require at least 3. Below version 2, membership is encoded as a legacy remove-peer entry carrying the full voter list, not arbitrary server IDs/nonvoters. Modern configuration encoding/decoding panics on serialization errors and does not itself validate membership. There is no protocol auto-negotiation. [Sources: api.go, membership methods](https://github.com/kavia-aditi/raft-10000001183/blob/main/api.go), [configuration.go, encodePeers/EncodeConfiguration/DecodeConfiguration](https://github.com/kavia-aditi/raft-10000001183/blob/main/configuration.go), [config.go, ProtocolVersion](https://github.com/kavia-aditi/raft-10000001183/blob/main/config.go).
+
+## Configuration defaults and validation
+
+Start from `DefaultConfig`, then set `LocalID`; the defaults alone fail validation because ID is empty. Durations below are initial values, not wall-clock service guarantees.
+
+| Field | Default | Validation/boundary |
+| --- | --- | --- |
+| `ProtocolVersion` | 3 | Supported speaking range 1 through 3, despite minimum understood constant 0. |
+| `HeartbeatTimeout` | 1 second | At least 5 ms; follower leader-contact timeout. |
+| `ElectionTimeout` | 1 second | At least 5 ms and at least heartbeat timeout. |
+| `CommitTimeout` | 50 ms | At least 1 ms; idle append scheduling, not a commitment deadline. |
+| `MaxAppendEntries` | 64 | Integer 1 through 1024 inclusive; count, not byte limit. |
+| `LeaderLeaseTimeout` | 500 ms | At least 5 ms and no greater than heartbeat timeout. |
+| `SnapshotInterval` | 120 seconds | At least 5 ms. |
+| `SnapshotThreshold` | 8192 | Unsigned log-index delta; no positive minimum validated. |
+| `TrailingLogs` | 10240 | Unsigned retention setting; zero permitted. |
+| `ShutdownOnRemove` | true | Controls leader reaction after losing its vote. |
+| `LogLevel` | `DEBUG` | Logger uses configured output, falling back to stderr. |
+
+All otherwise unset booleans are false, including `BatchApplyCh`, `NoSnapshotRestoreOnStart`, `PreVoteDisabled`, `NoLegacyTelemetry`, and `RestoreCommittedLogs`. Logger/output/channels start nil. A provided `Logger` overrides output/level construction. `NotifyCh` can block leadership transitions unless buffered or aggressively consumed. `ValidateConfig` does not test stores, transport, address connectivity, nil collaborators, or snapshot format correctness. `NewRaft` additionally requires ID equal to transport address below protocol 3. [Sources: config.go, DefaultConfig/ValidateConfig/getOrCreateLogger](https://github.com/kavia-aditi/raft-10000001183/blob/main/config.go), [api.go, NewRaft](https://github.com/kavia-aditi/raft-10000001183/blob/main/api.go).
+
+`ReloadConfig` replaces exactly five fields: trailing logs, snapshot interval, snapshot threshold, heartbeat timeout, election timeout. It copies zero values too, validates the complete resulting config, and installs nothing on validation failure. Do not construct a partial zero-valued update expecting merge semantics. Obtain `ReloadableConfig`, modify it, and serialize concurrent read-modify-write operations externally. Shortening heartbeat timeout wakes relevant loops; changing trailing logs takes effect on later compaction, not immediately. [Source: api.go, ReloadConfig/ReloadableConfig](https://github.com/kavia-aditi/raft-10000001183/blob/main/api.go).
+
+### Optional committed-log recovery
+
+With `RestoreCommittedLogs=true`, the actual supplied store must implement `CommitTrackingLogStore` or startup returns `ErrIncompatibleLogStore`. Its staged commit index must be persisted atomically with the next `StoreLogs`, never independently, and must not exceed persisted last index. Recovery clamps an excessive reported index to `LastIndex` and calls `processLogs`. Staging errors are logged rather than aborting replication. Consequently, persisted knowledge can lag in-memory commitment. [Sources: log.go, CommitTrackingLogStore](https://github.com/kavia-aditi/raft-10000001183/blob/main/log.go), [api.go, restoreFromCommittedLogs](https://github.com/kavia-aditi/raft-10000001183/blob/main/api.go), [raft.go, tryStageCommitIndex](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go).
+
+**Inferred startup hazard:** do not infer the config comment's promised completed FSM replay before `NewRaft` returns from this implementation: recovery queues through `processLogs`, while `runFSM` starts later, and there is no explicit FSM-completion barrier here. The queue has capacity 128; replay exceeding available queue slots can block before that consumer starts. This is an implementation hazard derived from the supplied startup/control flow, not a tested failure report. [Sources: api.go, NewRaft](https://github.com/kavia-aditi/raft-10000001183/blob/main/api.go), [raft.go, processLogs](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go).
+
+## Replication, retries, and backoff
+
+### Request construction and follower acceptance
+
+The leader creates a replication worker for every other latest-configuration member, including nonvoters, initially sending from last index plus one. `setupAppendEntries` includes current leader commit index, previous index/term, and at most `MaxAppendEntries` new logs. Previous index zero needs no log; the snapshot boundary uses snapshot metadata. Other previous/new entries come from `LogStore`. There is no byte-size bound in `setNewLogs`. [Sources: raft.go, startStopReplication](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go), [replication.go, setupAppendEntries/setPreviousLog/setNewLogs](https://github.com/kavia-aditi/raft-10000001183/blob/main/replication.go).
+
+Follower `appendEntries` rejects older terms; newer terms force follower state and persist the term. Same-term nonfollowers normally step down, with an explicit exception for leadership-transfer candidacy. It verifies previous term, skips entries matching stored index/term, deletes the suffix on the first term conflict, then stores replacement/new entries. Matching terms are not a byte-by-byte payload comparison. Missing previous logs or previous-term mismatch sets `NoRetryBackoff=true`; read/delete/store failures otherwise reject. After acceptance, commit advances to `min(LeaderCommitIndex, local last index)` and the follower queues that prefix for FSM processing. [Source: raft.go, appendEntries](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go).
+
+Deletion plus replacement storage is not one transaction in this function. The code explicitly notes stale in-memory last-log state if suffix truncation succeeds but subsequent storage fails. Do not infer rollback from a failed append response. [Source: raft.go, appendEntries](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go).
+
+### Retry state and snapshot fallback
+
+Normal append success advances acknowledged `nextIndex`, reports match, clears failures, and permits pipeline mode. Rejection sets:
+
+```text
+nextIndex = max(min(oldNextIndex - 1, followerLastLog + 1), 1)
+```
+
+It immediately retries toward the target while entries remain. Rejection with `NoRetryBackoff` resets failures; other rejections increment them. Transport errors increment failures and return to the outer loop, whose trigger/idle timer causes another attempt. Non-`ErrLogNotFound` setup errors return without incrementing failures. There is no fixed total retry count or catch-up deadline. [Source: replication.go, replicate/replicateTo](https://github.com/kavia-aditi/raft-10000001183/blob/main/replication.go).
+
+Before ordinary retries with failures, delay is `backoff(10ms, failures, 12)`: rounds 1 and 2 both wait 10 ms, round 3 waits 20 ms, doubling to 10.24 seconds at round 12 and thereafter. This is not a conventional doubling starting with the second failure. Shutdown can interrupt this wait; per-follower removal is checked later rather than being a branch of that wait. [Sources: util.go, backoff](https://github.com/kavia-aditi/raft-10000001183/blob/main/util.go), [replication.go, replicateTo](https://github.com/kavia-aditi/raft-10000001183/blob/main/replication.go).
+
+Exact `ErrLogNotFound` during ordinary request setup switches to `sendLatestSnapshot`. It selects the first listed snapshot, opens/streams it with metadata, and closes its reader afterward. No snapshot means an error, not automatic creation. A successful response sets next index to snapshot index plus one, reports match, and resumes log catch-up. Transport errors/rejections increment failures; list/open failures do not. Higher-term append/snapshot replies notify verification failures and signal leader step-down; that signal does not itself rewrite the local term. [Source: replication.go, sendLatestSnapshot/handleStaleTerm](https://github.com/kavia-aditi/raft-10000001183/blob/main/replication.go).
+
+### Pipelines, heartbeats, and leases
+
+After ordinary success, `pipelineReplicate` asks the transport for an `AppendPipeline`. Unsupported pipelining quietly falls back; other creation errors are logged. Sends advance a speculative local send cursor; only decoded successful responses advance acknowledged state and commitment. Setup/send failure or rejected response aborts pipeline operation and returns to ordinary repair. A pipeline higher-term response signals step-down. Pipeline concurrency limits and transport-level RPC deadlines are not defined by this replication logic. [Source: replication.go, pipelineReplicate/pipelineSend/pipelineDecode](https://github.com/kavia-aditi/raft-10000001183/blob/main/replication.go).
+
+Separate heartbeats avoid being held behind log/snapshot I/O. They run on forced notification or randomized intervals from `HeartbeatTimeout/10` up to, but excluding, twice that value. Their requests omit entries and commit progress; idle normal append traffic at randomized `CommitTimeout` intervals conveys commitment. Heartbeat failures have their own counter and exponential delay capped at `HeartbeatTimeout/2`. A received heartbeat response refreshes last contact and votes verification according to `Success`; this heartbeat loop does not explicitly process a higher response term like `replicateTo` does. Last contact is therefore not the same as a successful log match. [Sources: replication.go, heartbeat/replicate](https://github.com/kavia-aditi/raft-10000001183/blob/main/replication.go), [util.go, randomTimeout/cappedExponentialBackoff](https://github.com/kavia-aditi/raft-10000001183/blob/main/util.go).
+
+`checkLeaderLease` counts self and recently contacted voters in the latest configuration. Fewer than a quorum within the lease timeout causes `Follower` state. Nonvoter contact cannot preserve leadership. Lease contact does not imply every contacted member has the latest entry. [Source: raft.go, checkLeaderLease](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go).
+
+## Snapshots and log compaction
+
+### Capture, persist, release
+
+Periodic snapshot checks occur in `[SnapshotInterval, 2*SnapshotInterval)`. `shouldSnapshot` compares unsigned `LogStore.LastIndex - lastSnapshotIndex` against threshold, not committed count or bytes; a storage error skips that check. The subtraction has no explicit underflow guard. A manual `Snapshot` bypasses the threshold, not capture/persistence checks. [Sources: snapshot.go, runSnapshots/shouldSnapshot](https://github.com/kavia-aditi/raft-10000001183/blob/main/snapshot.go), [util.go, randomTimeout](https://github.com/kavia-aditi/raft-10000001183/blob/main/util.go).
+
+FSM capture is serialized with `Apply`; expensive persistence runs concurrently with later application. Your snapshot must remain a consistent captured view under those updates. The FSM worker rejects snapshot requests only when its internal last index is zero, so `ErrNothingNewToSnapshot` is not a general comparison against the previous saved snapshot. `Release` runs for a successfully acquired snapshot even if persistence is skipped or later fails. [Source: fsm.go, FSM/FSMSnapshot/runFSM](https://github.com/kavia-aditi/raft-10000001183/blob/main/fsm.go).
+
+`takeSnapshot` captures FSM index/term, obtains committed membership, and rejects when captured index is below committed configuration index. Despite broader comments about outstanding changes, this check is not simply `latestIndex != committedIndex`. It then creates a sink, calls `Persist`, cancels on persistence error, closes the sink, updates last-snapshot metadata, and compacts logs. The interface tells `Persist` to close on success, and Raft closes again, so sinks must handle that usage. A close error returns before metadata advancement; compaction failure returns after snapshot persistence and metadata advancement, without undoing them. [Source: snapshot.go, takeSnapshot](https://github.com/kavia-aditi/raft-10000001183/blob/main/snapshot.go).
+
+### Retention arithmetic
+
+`compactLogsWithTrailing(snapshotIndex, lastLogIndex, trailing)` first reads `FirstIndex`. If `lastLogIndex <= trailing`, it does nothing. Otherwise the inclusive deletion endpoint is:
+
+```text
+min(snapshotIndex, lastLogIndex - trailing)
+```
+
+It deletes only when first index is no greater than that endpoint. Example: snapshot 12000, last log 15000, trailing 10240 deletes through 4760, not through 12000. Trailing zero permits deleting every log through the snapshot; entries after it remain. This is index-based retention, not an exact retained-entry count when stores contain gaps, and not a disk-capacity ceiling. Lower retention can force lagging followers onto snapshot transfer. [Source: snapshot.go, compactLogsWithTrailing/compactLogs](https://github.com/kavia-aditi/raft-10000001183/blob/main/snapshot.go).
+
+`FileSnapshotStore` requires retention of at least one snapshot. Its implementation uses temporary directories, metadata/state files, CRC64 verification on open, finalization/rename, and reaping. File synchronization is implemented, with platform-specific directory-sync handling; this does not establish an arbitrary filesystem's power-loss guarantees. Custom stores do not inherit these behaviors. Snapshot metadata version covers Raft metadata, not your application's data format. [Sources: file_snapshot.go, Create/Open/Close/finalize/ReapSnapshots](https://github.com/kavia-aditi/raft-10000001183/blob/main/file_snapshot.go), [snapshot.go, SnapshotMeta](https://github.com/kavia-aditi/raft-10000001183/blob/main/snapshot.go).
+
+### Startup, network installation, and user restore
+
+Startup tries listed snapshots newest first and falls back after open/FSM restore failures; if snapshots exist but none restore, startup fails. `NoSnapshotRestoreOnStart` skips opening/restoring application data while still accepting metadata for indexes/configuration. It does not restore your application by another mechanism for you. [Source: api.go, restoreSnapshot/tryRestoreSingleSnapshot](https://github.com/kavia-aditi/raft-10000001183/blob/main/api.go).
+
+Network installation accepts snapshot metadata versions 0 through 1, rejects older terms, decodes membership, copies into a local sink, checks copied size exactly, finalizes, then restores the FSM. Copy/size failures cancel the sink; restore failure returns an RPC error without undoing already finalized snapshot storage. Success updates applied/snapshot indexes and both membership views. A monotonic store has all old logs removed; other stores use normal compaction. Cleanup errors are logged and do not prevent a successful response. Remaining stream data is drained on all return paths. [Source: raft.go, installSnapshot](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go).
+
+User `Restore` is different: the leader rejects outstanding membership changes, aborts inflight requests with `ErrAbortedByRestore`, and uses current membership/current term rather than snapshot membership. It burns index `max(localLastIndex, suppliedSnapshotIndex)+1` to force replication discontinuity. Copy size must match metadata; FSM restore failure panics because the node is already in a dangerous state. Monotonic stores delete old logs; others retain the discontinuity. The public method then waits for a no-op to commit, establishing quorum progress after restoration, not completion on every follower. Its enqueue timer does not interrupt an already executing restore or roll it back if a later step fails. [Sources: raft.go, restoreUserSnapshot](https://github.com/kavia-aditi/raft-10000001183/blob/main/raft.go), [api.go, Restore](https://github.com/kavia-aditi/raft-10000001183/blob/main/api.go).
+
+## Log cache: performance without stronger storage semantics
+
+`NewLogCache(capacity, store)` requires positive capacity and allocates a fixed-size ring of `*Log`; no default or maximum capacity is defined. Slot selection is `index % capacity`, with an exact cached-index check to avoid returning a collided entry. It is not an LRU cache. [Source: log_cache.go, NewLogCache/GetLog](https://github.com/kavia-aditi/raft-10000001183/blob/main/log_cache.go).
+
+- `GetLog` returns a shallow struct copy on hit. On miss it delegates directly and does not fill the cache.
+- `StoreLog` delegates to `StoreLogs`. `StoreLogs` writes the backend first; only success inserts supplied pointers into slots. Failure returns a formatted error using `%q`, not an error-wrapping `%w` chain.
+- `FirstIndex` and `LastIndex` always delegate.
+- `DeleteRange` invalidates the entire cache before delegating, including when deletion fails. It does not roll back invalidation.
+- `IsMonotonic` forwards that optional capability, otherwise false. It does not forward `CommitTrackingLogStore`; enabling committed-log recovery with this wrapper fails the required interface check even if its backend supports it.
+
+The ring lock protects cache slots, not immutable ownership of logs. Stored pointers and copied `Data`/`Extensions` slices can alias caller memory. Do not mutate submitted logs or returned byte slices assuming deep-copy isolation. Backend operations occur outside the ring lock, so this wrapper alone does not serialize a concurrent miss/write/delete into an atomic storage operation. It adds neither durability nor transactional guarantees nor automatic backend cleanup. [Sources: log_cache.go, all methods](https://github.com/kavia-aditi/raft-10000001183/blob/main/log_cache.go), [log.go, Log/CommitTrackingLogStore](https://github.com/kavia-aditi/raft-10000001183/blob/main/log.go).
+
+## Safe-change checklist and verification
+
+**Proposed operational checks:** preserve log/command numeric values; distinguish last log, commit, queued application, and completed application; serialize membership changes; measure nonvoter readiness before promotion; retain enough logs for expected outage/restore duration; implement snapshot isolation and cancellation; verify optional interfaces survive wrappers; treat storage failures and leadership-loss retries as potentially ambiguous outcomes.
+
+The module declares Go `1.25.0`, newer than README's historical `1.16+` statement. Follow the module requirement for this source. `Makefile` defines race-enabled normal and `batchtest` test runs, integration runs gated by `INTEG_TESTS=yes`, and a separate `fuzzy` module. These are available verification paths, not evidence of passing results. [Sources: go.mod](https://github.com/kavia-aditi/raft-10000001183/blob/main/go.mod), [Makefile](https://github.com/kavia-aditi/raft-10000001183/blob/main/Makefile).
+
+```bash
+make test
+make integ
+make fuzz
+```
+
+Coverage focuses on the six requested subsystems and their integration boundaries. Full election correctness, transport security, external storage implementations, dependency algorithms, and application read-consistency design are not assessed. No comparison score is assigned because a second documentation artifact and measured results were not supplied.
